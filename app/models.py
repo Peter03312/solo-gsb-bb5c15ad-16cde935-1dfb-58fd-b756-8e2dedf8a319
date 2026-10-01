@@ -82,3 +82,43 @@ class ProjectionBatchIn(BaseModel):
 
     expected_revision: int = Field(ge=0, description="该推演当前修订号；不一致则整批拒绝")
     operations: List[Operation] = Field(min_length=1)
+
+
+class PeriodAnchorIn(BaseModel):
+    """地层期位锚点：stratum 必须位于第 position 期（1～total_periods）。
+
+    同一期等价组中的锚点须指同一期位，否则分析结果不可行（anchor_position_conflict）；
+    锚点地层编号在请求内不得重复（重复属请求结构错误，明确拒绝）。
+    """
+
+    stratum: str = Field(min_length=1, max_length=128, description="已登记（或推演基线内）的地层编号")
+    position: int = Field(ge=1, le=64, description="锚定期位（1～总期数，期位越界在服务层按总期数再校验）")
+
+
+class ArrangementIn(BaseModel):
+    """分期试排（只读，不写修订）：在正式或指定推演的**同一只读视图**内读取地层与生效断言。
+
+    - view=formal（默认）：在 expected_revision 对应的当前正式视图中分析，过期按
+      STALE_REVISION 拒绝；view=projection：按 projection_id 推演的冻结视图
+      （已关闭推演仍按其冻结视图分析），expected_revision 须为该推演当前修订号；
+    - total_periods 为总期数（1～64）；
+    - anchors 为可选地层期位锚点；同一期等价组占同一期、早于源组期位严格小于目标组、
+      未锚定组可占任一期；
+    - 可行时返回每组所含地层及其在**所有**可行排布中的最早/最晚期位（不给单套任意排布）；
+      不可行时区分同组锚点矛盾与先后链不相容（对期数或锚点），附关联锚点与证据路径，
+      不返回部分排布。全程只读，不写库、不递增任何修订号。
+    """
+
+    view: Literal["formal", "projection"] = Field(
+        default="formal", description="视图：formal=当前正式修订视图；projection=指定推演的冻结视图"
+    )
+    projection_id: Optional[int] = Field(
+        default=None, ge=1, description="view=projection 时必填：推演编号（含已关闭推演的冻结视图）"
+    )
+    expected_revision: int = Field(
+        ge=0, description="预期修订号：正式视图为当前正式修订号；推演视图为该推演当前修订号"
+    )
+    total_periods: int = Field(ge=1, le=64, description="总期数（1～64）")
+    anchors: Optional[List[PeriodAnchorIn]] = Field(
+        default=None, description="可选地层期位锚点；锚点地层编号不得重复，期位须在 1～总期数内"
+    )

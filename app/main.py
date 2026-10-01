@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
+from . import changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service, arrangements
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,13 +19,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
         "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
+        "支持只读分期试排（/periodization/arrangements）：给定总期数与地层期位锚点，"
+        "在正式或指定推演的同一只读视图中求每组在所有可行排布中的最早/最晚期位，"
+        "不可行时区分同组锚点矛盾与先后链不相容并附证据路径，不写任何修订；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -168,6 +171,29 @@ def get_periodization(
       无断言时各地层各自成组、边为空。
     """
     return periodization_svc.get_periodization(expected_revision)
+
+
+@app.post("/periodization/arrangements", tags=["query"])
+def post_periodization_arrangement(body: ArrangementIn):
+    """分期试排（只读）：在正式或指定推演的同一只读视图内求各组可行期位范围。
+
+    - 约束：同一期等价组占同一期；早于源组期位严格小于目标组；未锚定组可占任一期；
+    - 可行（feasible=true）：返回每组所含地层及其在**所有**可行排布中的最早
+      （earliest_position）与最晚（latest_position）期位，锚定组二者相等；
+      不返回单套任意排布；
+    - 不可行（feasible=false，HTTP 仍为 200）：conflicts 区分
+      `anchor_position_conflict`（同组锚点矛盾，列全部关联锚点）与
+      `chain_incompatible`（kind=anchor_too_early 先后链与锚点不相容 /
+      kind=chain_exceeds_periods 先后链与总期数不相容），附组链、证据路径与逐步断言；
+      不返回部分排布；
+    - view=formal（默认）校验 expected_revision 为当前正式修订号；
+      view=projection 须给 projection_id，expected_revision 为该推演当前修订号，
+      已关闭推演仍按其冻结视图分析（projection_status 回显）；
+    - 视图或地层不存在、修订号过期（409 STALE_REVISION）、锚点地层重复
+      （400 DUPLICATE_ANCHOR_STRATUM）、期位越界（400 ANCHOR_POSITION_OUT_OF_RANGE）
+      均明确拒绝；全程只读，不写任何修订、不改变既有接口语义。
+    """
+    return arrangements.analyze_arrangement(body)
 
 
 # ------------------------------------------------------------------ 修订变化追踪
