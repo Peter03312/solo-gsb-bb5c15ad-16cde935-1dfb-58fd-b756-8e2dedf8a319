@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
+from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,13 +19,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
         "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
+        "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
+        "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
+        "不可行时区分同组锚点矛盾、先后链与锚点不相容、先后链与期数不相容并附证据路径；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -170,6 +173,25 @@ def get_periodization(
     return periodization_svc.get_periodization(expected_revision)
 
 
+@app.post("/periodization/arrangement", tags=["query"])
+def post_periodization_arrangement(body: ArrangementIn):
+    """当前正式修订视图下的分期试排（只读，不写库、不递增修订号）。
+
+    - 同一期等价组须占同一期，早于关系源组期位严格小于目标组；未锚定组可占任一期；
+    - 可行时返回每组所含地层及其在**全部可行排布**中的最早 / 最晚期位
+      （`earliest_period` / `latest_period`），而非某一套任意排布；
+    - 不可行时 HTTP 200、`feasible=false`，`reasons[]` 区分：
+      `anchor_group_conflict`（同组锚点矛盾）、
+      `anchor_precedence_conflict`（先后链与锚点不相容）、
+      `chain_exceeds_periods`（先后链与期数不相容）；
+      每条原因附关联锚点、组链与 `evidence_path`，不返回任何组的期位；
+    - 总期数取 1～64；锚点期位越界 400 INVALID_PERIOD_POSITION、锚点地层重复
+      400 DUPLICATE_STRATUM、锚点地层不存在 400 INVALID_STRATUM；
+    - 修订号过期 409 STALE_REVISION（details.current_revision），全程只读快照。
+    """
+    return arrangement_svc.arrange_formal(body)
+
+
 # ------------------------------------------------------------------ 修订变化追踪
 @app.get("/revision-changes", tags=["changes"])
 def get_revision_changes(
@@ -281,6 +303,18 @@ def get_projection_relationship(
 ):
     """查询推演视角下两地层的关系及支撑证据路径（路径标注 base/projection 来源）。"""
     return projections.query_projection_relationship(projection_id, a, b)
+
+
+@app.post("/projections/{projection_id}/periodization/arrangement", tags=["projections"])
+def post_projection_periodization_arrangement(projection_id: int, body: ArrangementIn):
+    """指定推演冻结视图下的分期试排（只读；已关闭推演 merged/discarded 仍可分析）。
+
+    视图为该推演创建时固定的地层 / 基线断言叠加推演内净变更；`expected_revision`
+    为推演自身修订号，过期 409 STALE_REVISION；推演不存在 404 PROJECTION_NOT_FOUND；
+    语义、返回结构与正式试排一致（额外回带 projection_id / status / base_revision）；
+    不写任何表、不改变推演状态与正式修订。
+    """
+    return arrangement_svc.arrange_projection(projection_id, body)
 
 
 @app.post("/projections/{projection_id}/merge", tags=["projections"])

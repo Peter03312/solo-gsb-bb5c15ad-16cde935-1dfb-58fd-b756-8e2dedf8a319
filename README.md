@@ -33,6 +33,19 @@
   修订号对应的同一正式视图中先按原批次语义处理新增与撤回，再寻找**不包含本批新增证据、也不
   重复本批撤回**的额外撤回集合：撤回数最少、并列时按证据编号序列字典序最小，返回该集合与
   应用后是否通过关系核验。预检**不生成修订、变化记录或断言**，正式批次请求与返回格式不变。
+- **分期试排（只读）**：`POST /periodization/arrangement`（正式）与
+  `POST /projections/{id}/periodization/arrangement`（推演冻结视图，含已关闭推演）输入
+  视图对应的 `expected_revision`、总期数 `total_periods`（1～64）及可选地层期位锚点
+  （`anchors[]`，期位 1～总期数）。同一期等价组须占同一期，早于关系源组期位严格小于目标
+  组，未锚定组可占任一期。**可行时返回每组所含地层，以及该组在所有可行排布中的最早 / 最晚
+  期位**（`earliest_period`/`latest_period`，ASAP/ALAP 界，不是某一套任意排布）；**不可行
+  时 HTTP 仍为 200、`feasible=false`，不返回任何组的期位**，`reasons[]` 区分三类：
+  同组锚点矛盾 `anchor_group_conflict`、先后链与锚点不相容 `anchor_precedence_conflict`、
+  先后链与期数不相容 `chain_exceeds_periods`，每条附关联锚点、组链与证据路径。分析在
+  `REPEATABLE READ READ ONLY` 快照事务内完成，不写库、不递增修订号；锚点地层不存在
+  （400 `INVALID_STRATUM`）、锚点地层重复（400 `DUPLICATE_STRATUM`）、锚点期位越界
+  （400 `INVALID_PERIOD_POSITION`）、修订号过期（409 `STALE_REVISION`）、推演不存在
+  （404 `PROJECTION_NOT_FOUND`）明确拒绝，既有查询与批次语义不变。
 
 ## 快速开始
 
@@ -76,6 +89,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
 | GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
+| POST | `/periodization/arrangement` | 正式视图只读分期试排：总期数 1～64 + 期位锚点，返回每组在所有可行排布中的最早/最晚期位 |
+| POST | `/projections/{id}/periodization/arrangement` | 推演冻结视图（含已关闭）只读分期试排，返回结构同正式 |
 | POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
 | GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
 | GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论 |
@@ -274,7 +289,123 @@ curl -s "$BASE/periodization?expected_revision=1"
 bash examples/periodization_demo.sh
 ```
 
-### 错误码
+### 分期试排：`POST /periodization/arrangement`（正式，只读）
+
+考古人员试排**当前正式修订**的分期时，给出总期数与可选地层期位锚点，服务在
+**同一只读快照视图**内读取地层与生效断言并求解：
+
+- **输入**（JSON）：
+  - `expected_revision`（≥0）：预期的当前正式修订号，过期返回 409 `STALE_REVISION`
+    （`details.current_revision` 为当前修订号），不输出混合版本；
+  - `total_periods`：总期数，取 **1～64**，期位自 1 起（超出由请求模型拒绝，HTTP 422）；
+  - `anchors[]`（可选）：每项 `{stratum, period}`，把该地层（及其同一期等价组）固定在
+    第 `period` 期；同一地层不可出现两次（400 `DUPLICATE_STRATUM`），期位须在
+    **1～总期数**内（400 `INVALID_PERIOD_POSITION`），地层须已登记
+    （400 `INVALID_STRATUM`）。
+- **约束**：同一期等价组占同一期；早于关系源组期位**严格小于**目标组；未锚定的组可占
+  1～总期数内任一期。等价组口径与 `/periodization` 骨架一致（组按最小编号排序）。
+- **可行**（HTTP 200，`feasible=true`）：返回每个组的 `strata` 与
+  `earliest_period` / `latest_period`——该组在**所有可行排布**中的最早 / 最晚期位
+  （二者相等即期位被唯一确定；锚定组恒相等且 `anchored=true`）。这是界，**不是某一套
+  任意排布**：界由 DAG 上的最早 / 最迟调度（ASAP/ALAP）求得，且 ASAP 排布与 ALAP
+  排布各自都能扩展为完整可行排布，故这两个界是紧的。
+- **不可行**（HTTP **200**，`feasible=false`）：**不返回任何组的期位**（不返回部分排布），
+  仅在 `reasons[]` 给出全部可定位原因，每条含组链 `group_chain`、端点 `start`/`end`
+  （锚点或首/末期边界）、所需 / 可用期位数与证据路径 `evidence_path`：
+
+  | `type` | 含义 |
+  | --- | --- |
+  | `anchor_group_conflict` | 同一期等价组被锚点钉到不同期位；附该组全部锚点与组内同一期证据链 |
+  | `anchor_precedence_conflict` | 先后链与锚点不相容：链端至少一侧是锚点（如两组被钉反序、锚点后容不下后继链）；`involved_anchors` 给关联锚点 |
+  | `chain_exceeds_periods` | 先后链与期数不相容：一条不含锚点端的严格链所需期位数超过总期数 |
+
+  `evidence_path` 沿组链取“同一期 + 早于”混合最优证据序列（证据数最少、并列字典序最小，
+  口径与关系查询一致），端点固定为锚点地层；未锚定端取链端组的最小编号地层。
+
+```bash
+curl -s -X POST "$BASE/periodization/arrangement" -H 'Content-Type: application/json' -d '{
+  "expected_revision": 1,
+  "total_periods": 4,
+  "anchors": [{"stratum": "L3", "period": 2}]
+}'
+```
+
+```json
+{
+  "feasible": true,
+  "total_periods": 4,
+  "scope": "formal",
+  "expected_revision": 1,
+  "current_revision": 1,
+  "revision": 1,
+  "groups": [
+    {"group": 1, "min_stratum": "L1", "strata": ["L1", "L2"],
+     "earliest_period": 1, "latest_period": 1, "anchored": false, "anchors": []},
+    {"group": 2, "min_stratum": "L3", "strata": ["L3"],
+     "earliest_period": 2, "latest_period": 2, "anchored": true,
+     "anchors": [{"stratum": "L3", "period": 2}]},
+    {"group": 3, "min_stratum": "L4", "strata": ["L4", "L5"],
+     "earliest_period": 3, "latest_period": 3, "anchored": false, "anchors": []}
+  ]
+}
+```
+
+不可行示例（总期数 2 容不下 3 个严格递增的组）：
+
+```json
+{
+  "feasible": false,
+  "total_periods": 2,
+  "scope": "formal",
+  "expected_revision": 1,
+  "current_revision": 1,
+  "revision": 1,
+  "reasons": [
+    {
+      "type": "chain_exceeds_periods",
+      "message": "先后链与期数不相容：3 个等价组须严格递增，至少需占 3 期，超过总期数 2",
+      "group_chain": [
+        {"group": 1, "min_stratum": "L1", "strata": ["L1", "L2"], "period": null},
+        {"group": 2, "min_stratum": "L3", "strata": ["L3"], "period": null},
+        {"group": 3, "min_stratum": "L4", "strata": ["L4", "L5"], "period": null}
+      ],
+      "start": {"kind": "boundary", "period": 1, "boundary": "first"},
+      "end": {"kind": "boundary", "period": 2, "boundary": "last"},
+      "required_periods": 3,
+      "available_periods": 2,
+      "involved_anchors": [],
+      "evidence_path": ["EV-001", "EV-002", "EV-003"]
+    }
+  ]
+}
+```
+
+### 推演冻结视图试排：`POST /projections/{id}/periodization/arrangement`（只读）
+
+语义、请求体与返回结构与正式试排一致，差别仅在视图与修订号口径：
+
+- 读取该推演**创建时固定的地层 / 基线断言**叠加推演内净变更（新增生效 + 基线撤回）；
+- `expected_revision` 是**推演自身修订号**（自 0 起，随推演批次递增），过期返回
+  409 `STALE_REVISION`（`details.projection_id`、`details.current_revision`）；
+- **已关闭推演（`merged` / `discarded`）仍按其冻结视图分析**，响应回带 `status`；
+  推演不存在返回 404 `PROJECTION_NOT_FOUND`；
+- 响应额外含 `scope="projection"`、`projection_id`、`status`、`base_revision`；
+  锚点地层以基线地层为准；分析不写任何表，推演状态与正式修订均不变。
+
+```bash
+curl -s -X POST "$BASE/projections/1/periodization/arrangement" \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "total_periods": 3, "anchors": []}'
+```
+
+完整端到端示例（最早/最晚界、锚点拉直、三类不可行与证据路径、结构拒绝、
+推演冻结视图、关闭后仍可读、全程只读）：
+
+```bash
+bash examples/arrangement_demo.sh
+```
+
+
 
 | HTTP | code | 含义 |
 | --- | --- | --- |
@@ -291,9 +422,10 @@ bash examples/periodization_demo.sh
 | 409 | `MERGE_EVIDENCE_TAKEN` | 并入失败：推演新增证据编号已被正式历史占用 |
 | 409 | `MERGE_CONFLICT` | 并入核验发现关系冲突（附冲突证据路径），双方不变 |
 | 400 | `INVALID_CURSOR` | 变化追踪分页游标无效 |
+| 400 | `INVALID_PERIOD_POSITION` | 分期试排：锚点期位越界（不在 1～总期数） |
 | 400 | `EMPTY_STRATA` | 成果包：地层集合为空 |
 | 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
-| 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 |
+| 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 |
 | 404 | `PACKAGE_NOT_FOUND` | 成果包不存在 |
 
 ## 正式修订关系变化追踪
@@ -556,6 +688,14 @@ bash examples/demo.sh
 bash examples/periodization_demo.sh
 ```
 
+分期试排演示（每组最早/最晚期位界、锚点拉直、同组锚点矛盾 /
+先后链与锚点 / 先后链与期数三类不可行及证据路径、结构拒绝、
+推演冻结视图与关闭后可读、全程只读）：
+
+```bash
+bash examples/arrangement_demo.sh
+```
+
 提交前预检演示（原批可通过 / 建议最少撤回 / 预算不足附冲突路径 /
 新断言自成矛盾不可修复 / 拒绝语义沿用正式批次 / 全程只读）：
 
@@ -601,13 +741,15 @@ app/
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
+  arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
-  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架
+  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架、分期试排
   db.py           # 连接池与模式初始化（启动时自动建表、幂等回填）
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
   periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
+  arrangement_demo.sh # 分期试排示例（最早/最晚界、锚点、三类不可行证据链、推演冻结视图）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/只读校验）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）

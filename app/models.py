@@ -82,3 +82,26 @@ class ProjectionBatchIn(BaseModel):
 
     expected_revision: int = Field(ge=0, description="该推演当前修订号；不一致则整批拒绝")
     operations: List[Operation] = Field(min_length=1)
+
+
+class PeriodAnchorIn(BaseModel):
+    """分期试排的地层期位锚点：该地层（及其同一期等价组）固定占据某一期。"""
+
+    stratum: str = Field(min_length=1, max_length=128, description="锚点地层编号（须存在于所读视图）")
+    period: int = Field(ge=1, le=64, description="锚定期位（1～总期数；越界在服务层按总期数拒绝）")
+
+
+class ArrangementIn(BaseModel):
+    """分期试排请求（只读，不写库、不递增修订号）。
+
+    在指定只读视图（当前正式修订或某推演的冻结视图）内读取地层与生效断言，
+    求每个同一期等价组在全部可行排布中的最早/最晚期位，或分类报告不可行原因。
+    expected_revision 必须与视图当前修订号一致，否则 STALE_REVISION。
+    """
+
+    expected_revision: int = Field(ge=0, description="视图当前修订号；正式为正式修订号，推演为推演修订号")
+    total_periods: int = Field(ge=1, le=64, description="总期数（1～64），期位自 1 起")
+    anchors: List[PeriodAnchorIn] = Field(
+        default_factory=list,
+        description="可选地层期位锚点；同一地层不可重复，期位须在 1～总期数内",
+    )
